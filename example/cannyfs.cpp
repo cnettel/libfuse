@@ -69,7 +69,7 @@
 #include <queue>
 
 #include <tbb/task_scheduler_init.h>
-#include <tbb/task_group.h>
+#include <tbb/task_arena.h>
 #include <tbb/concurrent_vector.h>
 #include <tbb/concurrent_queue.h>
 
@@ -331,7 +331,7 @@ public:
 };
 
 task_scheduler_init init(16);
-task_group workQueue;
+task_arena workQueue(16);
 
 int cannyfs_add_write(bool defer, function<int(int)> fun)
 {
@@ -342,7 +342,7 @@ int cannyfs_add_write(bool defer, function<int(int)> fun)
 	}
 	else
 	{
-		workQueue.run([eventIdNow, fun]() {
+		workQueue.enqueue([eventIdNow, fun]() {
 			if (options.verbose) fprintf(stderr, "Doing event ID %lld\n", eventIdNow); 
 			return fun(eventIdNow); });
 		return 0;
@@ -1052,5 +1052,4 @@ int main(int argc, char *argv[])
 #endif
 	cannyfs_oper.flock = cannyfs_flock;
 	int toret = fuse_main(argc, argv, &cannyfs_oper, NULL);
-	workQueue.wait();
 }
