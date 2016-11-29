@@ -37,7 +37,7 @@
 #endif
 
 #define HAVE_UTIMENSAT
-//#define HAVE_SETXATTR
+#define HAVE_SETXATTR
 
 
 #include <fuse.h>
@@ -1029,6 +1029,9 @@ static int cannyfs_create(const char *cpath, mode_t mode, struct fuse_file_info 
 
 static int cannyfs_open(const char *path, struct fuse_file_info *fi)
 {
+	// TODO: Depending on the state of the parent directory and previous operations on the file,
+	// this could reasonably be made eager sometimes.
+	cannyfs_reader b(path, JUST_BARRIER);
 	if (options.verbose) fprintf(stderr, "Going to open %s\n", path);
 	int fd;
 
@@ -1044,6 +1047,7 @@ static int cannyfs_open(const char *path, struct fuse_file_info *fi)
 static int cannyfs_read(const char *path, char *buf, size_t size, off_t offset,
 		    struct fuse_file_info *fi)
 {
+	cannyfs_reader b(path, JUST_BARRIER);
 	int res;
 
 	(void) path;
