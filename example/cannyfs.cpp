@@ -138,6 +138,7 @@ struct cannyfs_filedata
 	queue<function<int(void)> > ops;
 
 	struct stat stats = {};
+	std::atomic<size_t> size{ 0 };
 	atomic_bool created{ false };
 	atomic_bool missing{ false };
 
@@ -626,6 +627,7 @@ static int cannyfs_getattr(const char *path, struct stat *stbuf)
 		if (wascreated)
 		{
 			*stbuf = b.fileobj->stats;
+			stbuf->st_size = b.fileobj->size;
 
 			return 0;
 		}
@@ -659,6 +661,10 @@ static int cannyfs_getattr(const char *path, struct stat *stbuf)
 static int cannyfs_fgetattr(const char *path, struct stat *stbuf,
 			struct fuse_file_info *fi)
 {
+	if (options.inaccuratestat)
+	{
+		return cannyfs_getattr(path, stbuf);
+	}
 	cannyfs_reader b(path, JUST_BARRIER);
 
 	int res;
@@ -1182,6 +1188,12 @@ static int cannyfs_write_buf(const char *cpath, struct fuse_bufvec *buf,
 		val += ret;
 	}
 
+	{
+		cannyfs_reader b(cpath, NO_BARRIER | LOCK_WHOLE);
+		size_t maybenewsize = (size_t)(sz + offset);
+		update_maximum(b.fileobj->size, maybenewsize);
+	}
+	
 	return val;
 }
 
