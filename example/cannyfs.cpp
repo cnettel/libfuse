@@ -62,8 +62,10 @@
 #include <sys/xattr.h>
 #endif
 #include <sys/file.h> /* flock(2) */
+#include <signal.h>
 
 #include <atomic>
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -138,6 +140,7 @@ struct cannyfs_filedata
 	queue<function<int(void)> > ops;
 
 	struct stat stats = {};
+	std::atomic<off_t> size{ 0 };
 	atomic_bool created{ false };
 	atomic_bool missing{ false };
 
@@ -324,6 +327,7 @@ private:
 	set<cannyfs_filedata, comp> data;
 	shared_timed_mutex lock;
 public:
+	atomic_bool syncnow = { false };
 	vector<cannyfs_filedata*> shallowcopy()
 	{
 		shared_lock<shared_timed_mutex> maplock(this->lock);
@@ -335,6 +339,25 @@ public:
 		}
 
 		return res;
+	}
+
+	void syncall(bool silent = false)
+	{
+		for (auto filedata : shallowcopy())
+		{
+			filedata->sync();
+		}
+		if (!silent) cerr << "[CannyFS] Global file sync completed." << std::endl;
+	}
+
+	void pollsync()
+	{
+		bool now = false;
+		syncnow.exchange(now);
+		if (now)
+		{
+			cerr << "[CannyFS] Initializing global file sync." << std::endl;
+		}
 	}
 
 	cannyfs_filedata* get(const bf::path& path, bool always, unique_lock<mutex>& lock, bool lockdata = false)
@@ -495,6 +518,8 @@ void cannyfs_filedata::run()
 
 int cannyfs_add_write_inner(bool defer, const std::string& path, auto fun)
 {
+	filemap.pollsync();
+
 	long long eventIdNow;
 
 	unique_lock<mutex> lock;
@@ -626,13 +651,14 @@ static int cannyfs_getattr(const char *path, struct stat *stbuf)
 		if (wascreated)
 		{
 			*stbuf = b.fileobj->stats;
+			stbuf->st_size = b.fileobj->size;
 
 			return 0;
 		}
 
 		if (options.assumecreateddirempty)
 		{
-			cannyfs_reader parentdata(bf::path(path).parent_path(), NO_BARRIER | LOCK_WHOLE);
+			cannyfs_reader parentdata(bf::path(path).parent_path(), NO_BARRIER);
 
 			// If the parent dir was missing or is known not to exist, we can safely (?) assume that the subentry does not exist unless WE created it
 			if (parentdata.fileobj && (parentdata.fileobj->missing || parentdata.fileobj->created))
@@ -642,12 +668,14 @@ static int cannyfs_getattr(const char *path, struct stat *stbuf)
 		}
 	}
 	int res = lstat(path, stbuf);
+	update_maximum(b.fileobj->size, stbuf->st_size);
+
 	if (res == -1)
 	{
 		int err = errno;
 		if (options.cachemissing && err == ENOENT)
 		{
-			cannyfs_reader b2(path, NO_BARRIER | LOCK_WHOLE);
+			cannyfs_reader b2(path, NO_BARRIER);
 			b.fileobj->missing = true;
 		}
 		return -errno;
@@ -669,7 +697,6 @@ static int cannyfs_fgetattr(const char *path, struct stat *stbuf,
 
 	(void) path;
 
-	fprintf(stderr, "Stat %s\n", path);
 	res = fstat(getfh(fi), stbuf);
 	if (res == -1)
 		return -errno;
@@ -854,7 +881,7 @@ static int cannyfs_unlink(const char *path)
 	// we should have a flag to do that.
 	// TODO: cannyfs_clear(path);
 	{
-		cannyfs_reader b(path, NO_BARRIER | LOCK_WHOLE);
+		cannyfs_reader b(path, NO_BARRIER);
 		b.fileobj->missing = true;
 		b.fileobj->created = false;
 	}
@@ -873,7 +900,7 @@ static int cannyfs_unlink(const char *path)
 static int cannyfs_rmdir(const char *path)
 {
 	{
-		cannyfs_reader b(path, NO_BARRIER | LOCK_WHOLE);
+		cannyfs_reader b(path, NO_BARRIER);
 		b.fileobj->missing = true;
 		b.fileobj->created = false;
 	}
@@ -984,6 +1011,7 @@ static int cannyfs_truncate(const char *path, off_t size)
 {
 	fprintf(stderr, "Truncate1?\n");
 	// TODO: FUN STUFF COULD BE DONE HERE TO AVOID WRITES
+	// TODO: Also update fileobj size value.
 	int res;
 
 	res = truncate(path, size);
@@ -998,6 +1026,7 @@ static int cannyfs_ftruncate(const char *path, off_t size,
 {
 	fprintf(stderr, "Truncate2?\n");
 	// TODO: FUN STUFF COULD BE DONE HERE TO AVOID WRITES
+	// TODO: Also update fileobj size value.
 	int res;
 
 	(void) path;
@@ -1088,6 +1117,7 @@ static int cannyfs_read_buf(const char *path, struct fuse_bufvec **bufp,
 			size_t size, off_t offset, struct fuse_file_info *fi)
 {
 	cannyfs_reader b(path, JUST_BARRIER);
+	cerr << "Read " << path << " from " << offset << " for " << size << " bytes.";
 	struct fuse_bufvec *src;
 
 	(void) path;
@@ -1191,6 +1221,12 @@ static int cannyfs_write_buf(const char *cpath, struct fuse_bufvec *buf,
 		val += ret;
 	}
 
+	{
+		cannyfs_reader b(cpath, NO_BARRIER);
+		off_t maybenewsize = (off_t)(sz + offset);
+		update_maximum(b.fileobj->size, maybenewsize);
+	}
+	
 	return val;
 }
 
@@ -1479,13 +1515,15 @@ int main(int argc, char *argv[])
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 
 	fuse_opt_parse(&args, &options, cannyfs_opts, nullptr);
+	signal(SIGUSR1, [](int) {
+		filemap.syncnow = true;
+		return 0;
+	});
 	int toret = fuse_main(args.argc, args.argv, &cannyfs_oper, NULL);
 	cerr << "[cannyfs] Unmounted. Finishing sync.\n";
 	// Flush everything BEFORE reporting errors.
-	for (auto filedata : filemap.shallowcopy())
-	{
-		filedata->sync();
-	}
+	filemap.syncall();
+	
 	if (errors.size())
 	{
 		cerr << "[cannyfs] ERRORS NOT REPORTED TO CALLER:\n";
