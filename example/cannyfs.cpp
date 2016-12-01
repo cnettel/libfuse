@@ -1457,6 +1457,7 @@ static struct fuse_operations cannyfs_oper;
 #define FS_OPT(t, p, v) { t, offsetof(struct cannyfs_options, p), v }
 
 static struct fuse_opt cannyfs_opts[] = {
+	FS_OPT("--verbose", verbose, true),
 	FS_OPT("--assumecreateddirempty", assumecreateddirempty, true),
 	FS_OPT("--cachemissing", cachemissing, true),
 	FS_OPT("--ignorefsync", ignorefsync, true),
